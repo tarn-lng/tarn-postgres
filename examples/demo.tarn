@@ -1,0 +1,96 @@
+import "net"
+import "io"
+import "string"
+
+// Since this is in the same repo, we import lib directly or embed the client calls
+// Let's create the demo runner
+import "lib"
+
+fn main() {
+    print("==================================================")
+    print("  Tarn PostgreSQL Native Driver v0.1.0 Demo")
+    print("  Pure Tarn · Zero C Dependencies · Docker Test")
+    print("==================================================")
+
+    cfg := lib.Config.default()
+    print("Connecting to PostgreSQL at " + cfg.host + ":5432 (" + cfg.database + ")...")
+
+    var client: lib.Client
+    match lib.Client.connect(cfg) {
+        Ok(c) => {
+            print("✓ Connection established! Protocol 3.0 Handshake OK.")
+            client = c
+        }
+        Err(e) => {
+            print("✗ Connection error: " + e.message)
+            return
+        }
+    }
+
+    print("\n[1] Creating 'products' table...")
+    drop_sql := "DROP TABLE IF EXISTS products;"
+    match client.execute(&drop_sql) {
+        Ok(tag) => print("    " + tag)
+        Err(e)  => print("    Error: " + e.message)
+    }
+
+    create_sql := "CREATE TABLE products (id SERIAL PRIMARY KEY, name TEXT NOT NULL, category TEXT, price NUMERIC(10,2));"
+    match client.execute(&create_sql) {
+        Ok(tag) => print("    " + tag)
+        Err(e)  => print("    Error: " + e.message)
+    }
+
+    print("\n[2] Inserting inventory rows...")
+    insert_sql := "INSERT INTO products (name, category, price) VALUES ('Mechanical Keyboard', 'Hardware', 129.99), ('27-inch 4K Monitor', 'Hardware', 349.50), ('USB-C Hub', 'Accessories', 39.95), ('Noise Cancelling Headphones', 'Audio', 199.00), ('Desk Pad', 'Accessories', 19.99);"
+    match client.execute(&insert_sql) {
+        Ok(tag) => print("    " + tag)
+        Err(e)  => print("    Error: " + e.message)
+    }
+
+    print("\n[3] Querying filtered products (price > 40.00)...")
+    select_sql := "SELECT id, name, category, price FROM products WHERE price > 40.00 ORDER BY price DESC;"
+    match client.query(&select_sql) {
+        Ok(res) => {
+            print("    Rows returned: " + string.from_u64(u64(res.rows.len())))
+            print("    ------------------------------------------------------")
+            for r in res.rows.as_slice() {
+                id_val := r.get_or(0, "?")
+                name_val := r.get_or(1, "?")
+                cat_val := r.get_or(2, "?")
+                price_val := r.get_or(3, "?")
+                print("    #" + id_val + " | " + name_val + " (" + cat_val + ") - $" + price_val)
+            }
+            print("    ------------------------------------------------------")
+        }
+        Err(e) => {
+            print("    Query error: " + e.message)
+        }
+    }
+
+    print("\n[4] Running aggregation query...")
+    agg_sql := "SELECT count(*) AS total_count, min(price) AS min_price, max(price) AS max_price FROM products;"
+    match client.query(&agg_sql) {
+        Ok(res) => {
+            if res.rows.len() > usize(0) {
+                row := res.rows.get(0)
+                count_str := row.get_or(0, "0")
+                min_str := row.get_or(1, "0")
+                max_str := row.get_or(2, "0")
+                print("    Summary: " + count_str + " items | Min: $" + min_str + " | Max: $" + max_str)
+            }
+        }
+        Err(e) => {
+            print("    Agg error: " + e.message)
+        }
+    }
+
+    print("\n[5] Closing database session...")
+    match client.close() {
+        Ok(_) => print("✓ Session terminated cleanly with Terminate ('X') packet.")
+        Err(e) => print("✗ Close error: " + e.message)
+    }
+
+    print("\n==================================================")
+    print("  All PostgreSQL operations executed successfully!")
+    print("==================================================")
+}

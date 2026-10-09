@@ -1,0 +1,338 @@
+// tarn-postgres: Native PostgreSQL Client Driver for Tarn
+// Implements PostgreSQL Frontend/Backend Protocol 3.0 over native TCP sockets.
+// Zero external dependencies; 100% pure Tarn.
+
+import "net"
+import "io"
+import "string"
+
+pub copy enum ErrorKind {
+    ConnectionFailed
+    AuthFailed
+    QueryFailed
+    ProtocolError
+    IoError
+}
+
+pub struct Error {
+    pub kind    ErrorKind
+    pub message string
+}
+
+pub fn Error.new(kind ErrorKind, message string) Error {
+    return Error{kind: kind, message: message}
+}
+
+pub struct Config {
+    pub host     string
+    pub port     u16
+    pub user     string
+    pub database string
+}
+
+pub fn Config.new(host string, port u16, user string, database string) Config {
+    return Config{
+        host: host,
+        port: port,
+        user: user,
+        database: database
+    }
+}
+
+pub fn Config.default() Config {
+    return Config{
+        host: "127.0.0.1",
+        port: 5432,
+        user: "postgres",
+        database: "testdb"
+    }
+}
+
+pub struct Row {
+    pub values Vec<string>
+}
+
+pub fn Row.new() Row {
+    return Row{values: Vec.new()}
+}
+
+pub fn Row.get(&self, index usize) Option<string> {
+    if index >= self.values.len() {
+        return None
+    }
+    return Some(self.values.get(index).clone())
+}
+
+pub fn Row.get_or(&self, index usize, fallback string) string {
+    match self.get(index) {
+        Some(val) => return val
+        None => return fallback
+    }
+}
+
+pub fn Row.len(&self) usize {
+    return self.values.len()
+}
+
+pub struct QueryResult {
+    pub columns     Vec<string>
+    pub rows        Vec<Row>
+    pub command_tag string
+}
+
+pub fn QueryResult.len(&self) usize {
+    return self.rows.len()
+}
+
+pub struct Client {
+    stream     net.TcpStream
+    pub status u8
+}
+
+fn read_exact(stream &mut net.TcpStream, target &mut []u8) Result<void, io.Error> {
+    var total = usize(0)
+    for total < target.len() {
+        n := try stream.read(&mut target[total..target.len()])
+        if n == usize(0) {
+            return Err(io.Error.new(io.ErrorKind.UnexpectedEof))
+        }
+        total = total + n
+    }
+    return Ok(())
+}
+
+fn read_u32(stream &mut net.TcpStream) Result<usize, io.Error> {
+    var buf = [4]u8{0, 0, 0, 0}
+    try read_exact(stream, &mut buf)
+    val := usize(buf[0]) * 16777216 + usize(buf[1]) * 65536 + usize(buf[2]) * 256 + usize(buf[3])
+    return Ok(val)
+}
+
+fn read_message(stream &mut net.TcpStream) Result<Vec<u8>, io.Error> {
+    len := try read_u32(stream)
+    payload_len := len - usize(4)
+    var payload: Vec<u8> = Vec.new()
+    var chunk = [64]u8{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+    var remaining = payload_len
+    for remaining > usize(0) {
+        var to_read = remaining
+        if to_read > usize(64) {
+            to_read = usize(64)
+        }
+        try read_exact(stream, &mut chunk[0..to_read])
+        for i in 0..to_read {
+            payload.push(chunk[i])
+        }
+        remaining = remaining - to_read
+    }
+    return Ok(payload)
+}
+
+fn push_u32_be(vec &mut Vec<u8>, val usize) {
+    v24 := val / 16777216
+    v16 := (val / 65536) % 256
+    v8 := (val / 256) % 256
+    v0 := val % 256
+    vec.push(u8(v24))
+    vec.push(u8(v16))
+    vec.push(u8(v8))
+    vec.push(u8(v0))
+}
+
+fn push_bytes(vec &mut Vec<u8>, data &string) {
+    bytes := string.bytes(data)
+    for b in bytes {
+        vec.push(b)
+    }
+}
+
+pub fn Client.connect(config Config) Result<Client, Error> {
+    addr := config.host + ":5432"
+    var stream: net.TcpStream
+    match net.TcpStream.connect(&addr) {
+        Ok(s) => { stream = s }
+        Err(e) => { return Err(Error.new(ErrorKind.ConnectionFailed, "Failed to connect to host")) }
+    }
+
+    // Build Protocol 3.0 StartupMessage
+    user_bytes := string.bytes(&config.user)
+    db_bytes := string.bytes(&config.database)
+    total_len := usize(4 + 4 + 5 + user_bytes.len() + 1 + 9 + db_bytes.len() + 1 + 1)
+
+    var startup: Vec<u8> = Vec.new()
+    push_u32_be(&mut startup, total_len)
+    startup.push(0)
+    startup.push(3)
+    startup.push(0)
+    startup.push(0)
+
+    push_bytes(&mut startup, &"user")
+    startup.push(0)
+    push_bytes(&mut startup, &config.user)
+    startup.push(0)
+
+    push_bytes(&mut startup, &"database")
+    startup.push(0)
+    push_bytes(&mut startup, &config.database)
+    startup.push(0)
+    startup.push(0)
+
+    match stream.write_all(startup.as_slice()) {
+        Ok(_) => {}
+        Err(e) => { return Err(Error.new(ErrorKind.ConnectionFailed, "Failed writing startup message")) }
+    }
+
+    var type_buf = [1]u8{0}
+    var ready = false
+    var tx_status = u8(73) // 'I'
+
+    for !ready {
+        match read_exact(&mut stream, &mut type_buf) {
+            Ok(_) => {}
+            Err(e) => { return Err(Error.new(ErrorKind.ProtocolError, "Failed reading handshake type")) }
+        }
+        m_type := type_buf[0]
+        var payload: Vec<u8>
+        match read_message(&mut stream) {
+            Ok(p) => { payload = p }
+            Err(e) => { return Err(Error.new(ErrorKind.ProtocolError, "Failed reading handshake message")) }
+        }
+
+        if m_type == u8(69) { // 'E' ErrorResponse
+            return Err(Error.new(ErrorKind.AuthFailed, "Postgres server rejected connection"))
+        }
+        if m_type == u8(90) { // 'Z' ReadyForQuery
+            if payload.len() > usize(0) {
+                tx_status = payload.at(0)
+            }
+            ready = true
+        }
+    }
+
+    return Ok(Client{stream: stream, status: tx_status})
+}
+
+pub fn Client.query(&mut self, sql &string) Result<QueryResult, Error> {
+    sql_bytes := string.bytes(sql)
+    q_len := sql_bytes.len() + 5
+
+    var q_buf: Vec<u8> = Vec.new()
+    q_buf.push(81) // 'Q'
+    push_u32_be(&mut q_buf, q_len)
+    push_bytes(&mut q_buf, sql)
+    q_buf.push(0)
+
+    match self.stream.write_all(q_buf.as_slice()) {
+        Ok(_) => {}
+        Err(e) => { return Err(Error.new(ErrorKind.IoError, "Write query failed")) }
+    }
+
+    var columns: Vec<string> = Vec.new()
+    var rows: Vec<Row> = Vec.new()
+    var command_tag = ""
+
+    var type_buf = [1]u8{0}
+    var done = false
+
+    for !done {
+        match read_exact(&mut self.stream, &mut type_buf) {
+            Ok(_) => {}
+            Err(e) => { return Err(Error.new(ErrorKind.ProtocolError, "Failed reading query response type")) }
+        }
+        m_type := type_buf[0]
+        var payload: Vec<u8>
+        match read_message(&mut self.stream) {
+            Ok(p) => { payload = p }
+            Err(e) => { return Err(Error.new(ErrorKind.ProtocolError, "Failed reading query payload")) }
+        }
+
+        if m_type == u8(69) { // 'E' ErrorResponse
+            return Err(Error.new(ErrorKind.QueryFailed, "Query execution error in Postgres"))
+        }
+
+        if m_type == u8(84) { // 'T' RowDescription
+            if payload.len() >= usize(2) {
+                num_fields := usize(payload.at(0)) * 256 + usize(payload.at(1))
+                var off = usize(2)
+                for f in 0..num_fields {
+                    name_start := off
+                    for off < payload.len() && payload.at(off) != u8(0) {
+                        off = off + 1
+                    }
+                    col_name_bytes := &payload.as_slice()[name_start..off]
+                    match string.from_utf8(col_name_bytes) {
+                        Some(name_str) => { columns.push(name_str) }
+                        None => { columns.push("?") }
+                    }
+                    off = off + 1
+                    off = off + 18 // skip field metadata
+                }
+            }
+        }
+
+        if m_type == u8(68) { // 'D' DataRow
+            if payload.len() >= usize(2) {
+                num_cols := usize(payload.at(0)) * 256 + usize(payload.at(1))
+                var row = Row.new()
+                var off = usize(2)
+                for c in 0..num_cols {
+                    b0 := usize(payload.at(off))
+                    b1 := usize(payload.at(off + 1))
+                    b2 := usize(payload.at(off + 2))
+                    b3 := usize(payload.at(off + 3))
+                    off = off + 4
+                    if b0 == usize(255) && b1 == usize(255) && b2 == usize(255) && b3 == usize(255) {
+                        row.values.push("NULL")
+                    } else {
+                        val_len := b0 * 16777216 + b1 * 65536 + b2 * 256 + b3
+                        val_bytes := &payload.as_slice()[off..(off + val_len)]
+                        match string.from_utf8(val_bytes) {
+                            Some(val_str) => { row.values.push(val_str) }
+                            None => { row.values.push("") }
+                        }
+                        off = off + val_len
+                    }
+                }
+                rows.push(row)
+            }
+        }
+
+        if m_type == u8(67) { // 'C' CommandComplete
+            match string.from_utf8(payload.as_slice()) {
+                Some(tag) => { command_tag = tag }
+                None => {}
+            }
+        }
+
+        if m_type == u8(90) { // 'Z' ReadyForQuery
+            if payload.len() > usize(0) {
+                self.status = payload.at(0)
+            }
+            done = true
+        }
+    }
+
+    return Ok(QueryResult{
+        columns: columns,
+        rows: rows,
+        command_tag: command_tag
+    })
+}
+
+pub fn Client.execute(&mut self, sql &string) Result<string, Error> {
+    res := try self.query(sql)
+    return Ok(res.command_tag)
+}
+
+pub fn Client.close(self) Result<void, Error> {
+    var s = self.stream
+    var term = [5]u8{120, 0, 0, 0, 4} // 'X' (Terminate)
+    match s.write_all(&term) {
+        Ok(_) => {}
+        Err(_) => {}
+    }
+    match s.close() {
+        Ok(_) => { return Ok(()) }
+        Err(e) => { return Err(Error.new(ErrorKind.IoError, "Close failed")) }
+    }
+}
