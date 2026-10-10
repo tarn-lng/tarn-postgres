@@ -7,13 +7,13 @@ fn main() {
     print("  Pure Tarn · Zero C Dependencies · Docker Test")
     print("==================================================")
 
-    cfg := lib.Config.default()
-    print("Connecting to PostgreSQL at " + cfg.host + ":5432 (" + cfg.database + ")...")
+    db_url := "postgres://postgres:postgres@127.0.0.1:5432/testdb?sslmode=prefer"
+    print("Connecting via URL: " + db_url)
 
     var client: lib.Client
-    match lib.Client.connect(cfg.clone()) {
+    match lib.Client.connect_url(&db_url) {
         Ok(c) => {
-            print("✓ Connection established! Protocol 3.0 Handshake OK.")
+            print("✓ Connection established via connect_url! Protocol 3.0 Handshake OK.")
             client = c
         }
         Err(e) => {
@@ -114,22 +114,39 @@ fn main() {
         Err(e) => print("✗ Close error: " + e.message)
     }
 
-    print("\n[8] Testing Connection Pool (Pool)...")
-    var pool = lib.Pool.new(cfg, 3)
-    print("    Acquiring client from pool...")
-    pool_query_sql := "SELECT count(*) FROM products WHERE category = $1;"
-    var cat_params = [1]string{"Hardware"}
-    match pool.query_params(&pool_query_sql, &cat_params[..]) {
-        Ok(res) => {
-            if res.rows.len() > usize(0) {
-                count_val := res.rows.get(0).get_or(0, "0")
-                print("    ✓ Pool query succeeded! Hardware items count: " + count_val)
+    print("\n[8] Testing Connection Pool via Pool.from_url(&url, 5)...")
+    var pool_res = lib.Pool.from_url(&db_url, 5)
+    match pool_res {
+        Ok(p) => {
+            var pool = p
+            print("    Acquiring client from pool...")
+            pool_query_sql := "SELECT count(*) FROM products WHERE category = $1;"
+            var cat_params = [1]string{"Hardware"}
+            match pool.query_params(&pool_query_sql, &cat_params[..]) {
+                Ok(res) => {
+                    if res.rows.len() > usize(0) {
+                        count_val := res.rows.get(0).get_or(0, "0")
+                        print("    ✓ Pool query succeeded! Hardware items count: " + count_val)
+                    }
+                }
+                Err(e) => print("    ✗ Pool query error: " + e.message)
             }
+            pool.close()
+            print("    ✓ Connection pool closed cleanly.")
         }
-        Err(e) => print("    ✗ Pool query error: " + e.message)
+        Err(e) => print("    ✗ Pool creation error: " + e.message)
     }
-    pool.close()
-    print("    ✓ Connection pool closed cleanly.")
+
+    print("\n[9] Testing URL parser with credentials, port, and query params...")
+    test_url := "postgres://alice:secret_pass@db.example.com:5433/production_db?sslmode=require"
+    match lib.Config.from_url(&test_url) {
+        Ok(parsed_cfg) => {
+            print("    ✓ Host: " + parsed_cfg.host + ", Port: " + string.from_u64(u64(parsed_cfg.port)))
+            print("    ✓ User: " + parsed_cfg.user + ", Password: " + parsed_cfg.password)
+            print("    ✓ Database: " + parsed_cfg.database)
+        }
+        Err(e) => print("    ✗ URL parse error: " + e.message)
+    }
 
     print("\n==================================================")
     print("  All PostgreSQL operations executed successfully!")

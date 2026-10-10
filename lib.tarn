@@ -23,19 +23,29 @@ pub fn Error.new(kind ErrorKind, message string) Error {
     return Error{kind: kind, message: message}
 }
 
+pub copy enum SslMode {
+    Disable
+    Prefer
+    Require
+}
+
 pub struct Config {
     pub host     string
     pub port     u16
     pub user     string
+    pub password string
     pub database string
+    pub ssl_mode SslMode
 }
 
-pub fn Config.new(host string, port u16, user string, database string) Config {
+pub fn Config.new(host string, port u16, user string, password string, database string) Config {
     return Config{
         host: host,
         port: port,
         user: user,
-        database: database
+        password: password,
+        database: database,
+        ssl_mode: SslMode.Prefer
     }
 }
 
@@ -44,7 +54,9 @@ pub fn Config.default() Config {
         host: "127.0.0.1",
         port: 5432,
         user: "postgres",
-        database: "testdb"
+        password: "",
+        database: "testdb",
+        ssl_mode: SslMode.Prefer
     }
 }
 
@@ -53,8 +65,158 @@ pub fn Config.clone(&self) Config {
         host: self.host.clone(),
         port: self.port,
         user: self.user.clone(),
-        database: self.database.clone()
+        password: self.password.clone(),
+        database: self.database.clone(),
+        ssl_mode: self.ssl_mode
     }
+}
+
+pub fn Config.with_password(self, password string) Config {
+    var c = self
+    c.password = password
+    return c
+}
+
+pub fn Config.with_ssl_mode(self, mode SslMode) Config {
+    var c = self
+    c.ssl_mode = mode
+    return c
+}
+
+fn find_char(s &string, start usize, ch u8) Option<usize> {
+    bytes := string.bytes(s)
+    var i = start
+    for i < bytes.len() {
+        if bytes[i] == ch {
+            return Some(i)
+        }
+        i = i + 1
+    }
+    return None
+}
+
+fn slice_str(s &string, start usize, end usize) string {
+    if start >= end || start >= s.len() {
+        return ""
+    }
+    var target_end = end
+    if target_end > s.len() {
+        target_end = s.len()
+    }
+    bytes := string.bytes(s)
+    match string.from_utf8(&bytes[start..target_end]) {
+        Some(res) => return res
+        None => return ""
+    }
+}
+
+pub fn Config.from_url(url &string) Result<Config, Error> {
+    var rest_idx = usize(0)
+    if string.starts_with(url, &"postgresql://") {
+        rest_idx = 13
+    } else {
+        if string.starts_with(url, &"postgres://") {
+            rest_idx = 11
+        } else {
+            return Err(Error.new(ErrorKind.ConnectionFailed, "URL must start with postgres:// or postgresql://"))
+        }
+    }
+
+    var main_end = url.len()
+    var query_start = usize(0)
+    match find_char(url, rest_idx, 63) { // '?'
+        Some(q_idx) => {
+            main_end = q_idx
+            query_start = q_idx + 1
+        }
+        None => {}
+    }
+
+    var auth_end = main_end
+    var db_name = "testdb"
+    match find_char(url, rest_idx, 47) { // '/'
+        Some(slash_idx) => {
+            if slash_idx < main_end {
+                auth_end = slash_idx
+                db_str := slice_str(url, slash_idx + 1, main_end)
+                if db_str.len() > 0 {
+                    db_name = db_str
+                }
+            }
+        }
+        None => {}
+    }
+
+    var user_name = "postgres"
+    var password = ""
+    var host_start = rest_idx
+    match find_char(url, rest_idx, 64) { // '@'
+        Some(at_idx) => {
+            if at_idx < auth_end {
+                user_info := slice_str(url, rest_idx, at_idx)
+                host_start = at_idx + 1
+                match find_char(&user_info, 0, 58) { // ':'
+                    Some(colon_idx) => {
+                        user_name = slice_str(&user_info, 0, colon_idx)
+                        password = slice_str(&user_info, colon_idx + 1, user_info.len())
+                    }
+                    None => {
+                        user_name = user_info
+                    }
+                }
+            }
+        }
+        None => {}
+    }
+
+    host_port_str := slice_str(url, host_start, auth_end)
+    var host_name = "127.0.0.1"
+    var port_num = u16(5432)
+    match find_char(&host_port_str, 0, 58) { // ':'
+        Some(colon_idx) => {
+            h := slice_str(&host_port_str, 0, colon_idx)
+            if h.len() > 0 {
+                host_name = h
+            }
+            p_str := slice_str(&host_port_str, colon_idx + 1, host_port_str.len())
+            match string.parse_u64(&p_str) {
+                Some(p_val) => { port_num = u16(p_val) }
+                None => {}
+            }
+        }
+        None => {
+            if host_port_str.len() > 0 {
+                host_name = host_port_str
+            }
+        }
+    }
+
+    var ssl_mode = SslMode.Prefer
+    if query_start > 0 {
+        query_str := slice_str(url, query_start, url.len())
+        if query_str.len() > 0 {
+            if string.contains(&query_str, &"sslmode=disable") || string.contains(&query_str, &"ssl=false") || string.contains(&query_str, &"ssl=0") {
+                ssl_mode = SslMode.Disable
+            } else {
+                if string.contains(&query_str, &"sslmode=require") || string.contains(&query_str, &"ssl=true") {
+                    ssl_mode = SslMode.Require
+                } else {
+                    if string.contains(&query_str, &"sslmode=prefer") {
+                        ssl_mode = SslMode.Prefer
+                    }
+                }
+            }
+        }
+    }
+
+    return Ok(Config{
+        host: host_name,
+        port: port_num,
+        user: user_name,
+        password: password,
+        database: db_name,
+        ssl_mode: ssl_mode
+    })
 }
 
 pub struct Row {
@@ -162,12 +324,51 @@ fn push_bytes(vec &mut Vec<u8>, data &string) {
     }
 }
 
+pub fn Client.connect_url(url &string) Result<Client, Error> {
+    cfg := try Config.from_url(url)
+    return Client.connect(cfg)
+}
+
 pub fn Client.connect(config Config) Result<Client, Error> {
-    addr := config.host + ":5432"
+    addr := config.host + ":" + string.from_u64(u64(config.port))
     var stream: net.TcpStream
     match net.TcpStream.connect(&addr) {
         Ok(s) => { stream = s }
-        Err(e) => { return Err(Error.new(ErrorKind.ConnectionFailed, "Failed to connect to host")) }
+        Err(e) => { return Err(Error.new(ErrorKind.ConnectionFailed, "Failed to connect to host: " + addr)) }
+    }
+
+    match config.ssl_mode {
+        SslMode.Disable => {}
+        _ => {
+            // Send SSLRequest: Int32(8) + Int32(80877103)
+            var ssl_req: Vec<u8> = Vec.new()
+            push_u32_be(&mut ssl_req, 8)
+            ssl_req.push(4)
+            ssl_req.push(210)
+            ssl_req.push(22)
+            ssl_req.push(47)
+
+            match stream.write_all(ssl_req.as_slice()) {
+                Ok(_) => {}
+                Err(e) => { return Err(Error.new(ErrorKind.ConnectionFailed, "Failed sending SSLRequest")) }
+            }
+
+            var ssl_resp = [1]u8{0}
+            match read_exact(&mut stream, &mut ssl_resp) {
+                Ok(_) => {}
+                Err(e) => { return Err(Error.new(ErrorKind.ProtocolError, "Failed reading SSL response")) }
+            }
+
+            if ssl_resp[0] == u8(78) { // 'N' - SSL not supported by server
+                match config.ssl_mode {
+                    SslMode.Require => {
+                        _ := stream.close()
+                        return Err(Error.new(ErrorKind.ConnectionFailed, "PostgreSQL server does not support SSL, but ssl_mode is set to Require"))
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 
     // Build Protocol 3.0 StartupMessage
@@ -215,8 +416,75 @@ pub fn Client.connect(config Config) Result<Client, Error> {
         }
 
         if m_type == u8(69) { // 'E' ErrorResponse
-            return Err(Error.new(ErrorKind.AuthFailed, "Postgres server rejected connection"))
+            var err_msg = "Postgres server rejected connection"
+            if payload.len() > usize(1) {
+                var off = usize(0)
+                for off < payload.len() {
+                    f_code := payload.at(off)
+                    off = off + 1
+                    if f_code == u8(0) { break }
+                    val_start := off
+                    for off < payload.len() && payload.at(off) != u8(0) {
+                        off = off + 1
+                    }
+                    if f_code == u8(77) { // 'M' message
+                        val_bytes := &payload.as_slice()[val_start..off]
+                        match string.from_utf8(val_bytes) {
+                            Some(m) => { err_msg = m }
+                            None => {}
+                        }
+                    }
+                    off = off + 1
+                }
+            }
+            _ := stream.close()
+            return Err(Error.new(ErrorKind.AuthFailed, err_msg))
         }
+
+        if m_type == u8(82) { // 'R' Authentication
+            if payload.len() >= usize(4) {
+                auth_type := usize(payload.at(0)) * 16777216 + usize(payload.at(1)) * 65536 + usize(payload.at(2)) * 256 + usize(payload.at(3))
+                if auth_type == usize(0) {
+                    // AuthenticationOk - continue
+                } else {
+                    if auth_type == usize(3) {
+                        // AuthenticationCleartextPassword
+                        if config.password.len() == 0 {
+                            _ := stream.close()
+                            return Err(Error.new(ErrorKind.AuthFailed, "Server requires password authentication but password is empty"))
+                        }
+                        pass_bytes := string.bytes(&config.password)
+                        p_len := pass_bytes.len() + 5
+                        var p_buf: Vec<u8> = Vec.new()
+                        p_buf.push(112) // 'p' PasswordMessage
+                        push_u32_be(&mut p_buf, p_len)
+                        push_bytes(&mut p_buf, &config.password)
+                        p_buf.push(0)
+                        match stream.write_all(p_buf.as_slice()) {
+                            Ok(_) => {}
+                            Err(_) => {
+                                _ := stream.close()
+                                return Err(Error.new(ErrorKind.IoError, "Failed sending password"))
+                            }
+                        }
+                    } else {
+                        if auth_type == usize(5) {
+                            _ := stream.close()
+                            return Err(Error.new(ErrorKind.AuthFailed, "Server requires MD5 password authentication (not yet supported)"))
+                        } else {
+                            if auth_type == usize(10) {
+                                _ := stream.close()
+                                return Err(Error.new(ErrorKind.AuthFailed, "Server requires SCRAM-SHA-256 password authentication (not yet supported)"))
+                            } else {
+                                _ := stream.close()
+                                return Err(Error.new(ErrorKind.AuthFailed, "Unsupported authentication type: " + string.from_u64(u64(auth_type))))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         if m_type == u8(90) { // 'Z' ReadyForQuery
             if payload.len() > usize(0) {
                 tx_status = payload.at(0)
@@ -546,6 +814,11 @@ pub fn Pool.new(config Config, max_size usize) Pool {
         max_size: max_size,
         clients: Vec.new()
     }
+}
+
+pub fn Pool.from_url(url &string, max_size usize) Result<Pool, Error> {
+    cfg := try Config.from_url(url)
+    return Ok(Pool.new(cfg, max_size))
 }
 
 pub fn Pool.acquire(&mut self) Result<Client, Error> {
