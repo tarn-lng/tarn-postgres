@@ -48,6 +48,15 @@ pub fn Config.default() Config {
     }
 }
 
+pub fn Config.clone(&self) Config {
+    return Config{
+        host: self.host.clone(),
+        port: self.port,
+        user: self.user.clone(),
+        database: self.database.clone()
+    }
+}
+
 pub struct Row {
     pub values Vec<string>
 }
@@ -135,6 +144,13 @@ fn push_u32_be(vec &mut Vec<u8>, val usize) {
     v0 := val % 256
     vec.push(u8(v24))
     vec.push(u8(v16))
+    vec.push(u8(v8))
+    vec.push(u8(v0))
+}
+
+fn push_u16_be(vec &mut Vec<u8>, val usize) {
+    v8 := (val / 256) % 256
+    v0 := val % 256
     vec.push(u8(v8))
     vec.push(u8(v0))
 }
@@ -324,6 +340,187 @@ pub fn Client.execute(&mut self, sql &string) Result<string, Error> {
     return Ok(res.command_tag)
 }
 
+pub fn Client.query_params(&mut self, sql &string, params &[]string) Result<QueryResult, Error> {
+    sql_bytes := string.bytes(sql)
+
+    var msg: Vec<u8> = Vec.new()
+
+    // 1. Parse ('P')
+    p_len := 4 + 1 + sql_bytes.len() + 1 + 2
+    msg.push(80) // 'P'
+    push_u32_be(&mut msg, p_len)
+    msg.push(0) // unnamed prepared statement
+    push_bytes(&mut msg, sql)
+    msg.push(0)
+    push_u16_be(&mut msg, 0) // 0 parameter data types specified (infer)
+
+    // 2. Bind ('B')
+    var b_payload_len = usize(1 + 1 + 2 + 2 + 2)
+    for p in params {
+        p_len := string.bytes(p).len()
+        b_payload_len = b_payload_len + 4 + p_len
+    }
+    b_len := 4 + b_payload_len
+    msg.push(66) // 'B'
+    push_u32_be(&mut msg, b_len)
+    msg.push(0) // unnamed portal
+    msg.push(0) // unnamed prepared statement
+    push_u16_be(&mut msg, 0) // 0 parameter format codes (all text)
+    push_u16_be(&mut msg, params.len())
+    for p in params {
+        p_bytes := string.bytes(p)
+        push_u32_be(&mut msg, p_bytes.len())
+        push_bytes(&mut msg, p)
+    }
+    push_u16_be(&mut msg, 0) // 0 result format codes (all text)
+
+    // 3. Describe ('D')
+    msg.push(68) // 'D'
+    push_u32_be(&mut msg, 6)
+    msg.push(80) // 'P' (portal)
+    msg.push(0) // unnamed portal
+
+    // 4. Execute ('E')
+    msg.push(69) // 'E'
+    push_u32_be(&mut msg, 9)
+    msg.push(0) // unnamed portal
+    push_u32_be(&mut msg, 0) // max rows: 0 (unlimited)
+
+    // 5. Sync ('S')
+    msg.push(83) // 'S'
+    push_u32_be(&mut msg, 4)
+
+    match self.stream.write_all(msg.as_slice()) {
+        Ok(_) => {}
+        Err(e) => { return Err(Error.new(ErrorKind.IoError, "Write query failed")) }
+    }
+
+    var columns: Vec<string> = Vec.new()
+    var rows: Vec<Row> = Vec.new()
+    var command_tag = ""
+    var query_err: Option<string> = None
+
+    var type_buf = [1]u8{0}
+    var done = false
+
+    for !done {
+        match read_exact(&mut self.stream, &mut type_buf) {
+            Ok(_) => {}
+            Err(e) => { return Err(Error.new(ErrorKind.ProtocolError, "Failed reading query response type")) }
+        }
+        m_type := type_buf[0]
+        var payload: Vec<u8>
+        match read_message(&mut self.stream) {
+            Ok(p) => { payload = p }
+            Err(e) => { return Err(Error.new(ErrorKind.ProtocolError, "Failed reading query payload")) }
+        }
+
+        if m_type == u8(69) { // 'E' ErrorResponse
+            var err_msg = "Query execution error in Postgres"
+            if payload.len() > usize(1) {
+                var off = usize(0)
+                for off < payload.len() {
+                    f_code := payload.at(off)
+                    off = off + 1
+                    if f_code == u8(0) {
+                        break
+                    }
+                    val_start := off
+                    for off < payload.len() && payload.at(off) != u8(0) {
+                        off = off + 1
+                    }
+                    if f_code == u8(77) { // 'M' human-readable message
+                        val_bytes := &payload.as_slice()[val_start..off]
+                        match string.from_utf8(val_bytes) {
+                            Some(m) => { err_msg = m }
+                            None => {}
+                        }
+                    }
+                    off = off + 1
+                }
+            }
+            query_err = Some(err_msg)
+        }
+
+        if m_type == u8(84) { // 'T' RowDescription
+            if payload.len() >= usize(2) {
+                num_fields := usize(payload.at(0)) * 256 + usize(payload.at(1))
+                var off = usize(2)
+                for f in 0..num_fields {
+                    name_start := off
+                    for off < payload.len() && payload.at(off) != u8(0) {
+                        off = off + 1
+                    }
+                    col_name_bytes := &payload.as_slice()[name_start..off]
+                    match string.from_utf8(col_name_bytes) {
+                        Some(name_str) => { columns.push(name_str) }
+                        None => { columns.push("?") }
+                    }
+                    off = off + 1
+                    off = off + 18 // skip field metadata
+                }
+            }
+        }
+
+        if m_type == u8(68) { // 'D' DataRow
+            if payload.len() >= usize(2) {
+                num_cols := usize(payload.at(0)) * 256 + usize(payload.at(1))
+                var row = Row.new()
+                var off = usize(2)
+                for c in 0..num_cols {
+                    b0 := usize(payload.at(off))
+                    b1 := usize(payload.at(off + 1))
+                    b2 := usize(payload.at(off + 2))
+                    b3 := usize(payload.at(off + 3))
+                    off = off + 4
+                    if b0 == usize(255) && b1 == usize(255) && b2 == usize(255) && b3 == usize(255) {
+                        row.values.push("NULL")
+                    } else {
+                        val_len := b0 * 16777216 + b1 * 65536 + b2 * 256 + b3
+                        val_bytes := &payload.as_slice()[off..(off + val_len)]
+                        match string.from_utf8(val_bytes) {
+                            Some(val_str) => { row.values.push(val_str) }
+                            None => { row.values.push("") }
+                        }
+                        off = off + val_len
+                    }
+                }
+                rows.push(row)
+            }
+        }
+
+        if m_type == u8(67) { // 'C' CommandComplete
+            match string.from_utf8(payload.as_slice()) {
+                Some(tag) => { command_tag = tag }
+                None => {}
+            }
+        }
+
+        if m_type == u8(90) { // 'Z' ReadyForQuery
+            if payload.len() > usize(0) {
+                self.status = payload.at(0)
+            }
+            done = true
+        }
+    }
+
+    match query_err {
+        Some(e) => return Err(Error.new(ErrorKind.QueryFailed, e))
+        None => {}
+    }
+
+    return Ok(QueryResult{
+        columns: columns,
+        rows: rows,
+        command_tag: command_tag
+    })
+}
+
+pub fn Client.execute_params(&mut self, sql &string, params &[]string) Result<string, Error> {
+    res := try self.query_params(sql, params)
+    return Ok(res.command_tag)
+}
+
 pub fn Client.close(self) Result<void, Error> {
     var s = self.stream
     var term = [5]u8{120, 0, 0, 0, 4} // 'X' (Terminate)
@@ -334,5 +531,71 @@ pub fn Client.close(self) Result<void, Error> {
     match s.close() {
         Ok(_) => { return Ok(()) }
         Err(e) => { return Err(Error.new(ErrorKind.IoError, "Close failed")) }
+    }
+}
+
+pub struct Pool {
+    pub config   Config
+    pub max_size usize
+    clients      Vec<Client>
+}
+
+pub fn Pool.new(config Config, max_size usize) Pool {
+    return Pool{
+        config: config,
+        max_size: max_size,
+        clients: Vec.new()
+    }
+}
+
+pub fn Pool.acquire(&mut self) Result<Client, Error> {
+    match self.clients.pop() {
+        Some(c) => return Ok(c)
+        None => return Client.connect(self.config.clone())
+    }
+}
+
+pub fn Pool.release(&mut self, client Client) {
+    if self.clients.len() < self.max_size {
+        self.clients.push(client)
+    } else {
+        _ := client.close()
+    }
+}
+
+pub fn Pool.query(&mut self, sql &string) Result<QueryResult, Error> {
+    var client = try self.acquire()
+    res := client.query(sql)
+    self.release(client)
+    return res
+}
+
+pub fn Pool.query_params(&mut self, sql &string, params &[]string) Result<QueryResult, Error> {
+    var client = try self.acquire()
+    res := client.query_params(sql, params)
+    self.release(client)
+    return res
+}
+
+pub fn Pool.execute(&mut self, sql &string) Result<string, Error> {
+    var client = try self.acquire()
+    res := client.execute(sql)
+    self.release(client)
+    return res
+}
+
+pub fn Pool.execute_params(&mut self, sql &string, params &[]string) Result<string, Error> {
+    var client = try self.acquire()
+    res := client.execute_params(sql, params)
+    self.release(client)
+    return res
+}
+
+pub fn Pool.close(&mut self) {
+    for !self.clients.is_empty() {
+        match self.clients.pop() {
+            Some(c) => { _ := c.close() }
+            None => break
+        }
     }
 }

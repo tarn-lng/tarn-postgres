@@ -11,7 +11,7 @@ fn main() {
     print("Connecting to PostgreSQL at " + cfg.host + ":5432 (" + cfg.database + ")...")
 
     var client: lib.Client
-    match lib.Client.connect(cfg) {
+    match lib.Client.connect(cfg.clone()) {
         Ok(c) => {
             print("✓ Connection established! Protocol 3.0 Handshake OK.")
             client = c
@@ -79,11 +79,57 @@ fn main() {
         }
     }
 
-    print("\n[5] Closing database session...")
+    print("\n[5] Testing Parameterized Query ($1, $2, $3)...")
+    insert_param_sql := "INSERT INTO products (name, category, price) VALUES ($1, $2, $3) RETURNING id, name;"
+    var ins_params = [3]string{"UltraWide Monitor", "Hardware", "499.99"}
+    match client.query_params(&insert_param_sql, &ins_params[..]) {
+        Ok(res) => {
+            if res.rows.len() > usize(0) {
+                row := res.rows.get(0)
+                print("    ✓ Inserted via parameters: id=" + row.get_or(0, "?") + ", name=" + row.get_or(1, "?"))
+            }
+        }
+        Err(e) => print("    ✗ Parameterized insert error: " + e.message)
+    }
+
+    print("\n[6] Testing SQL Injection immunity via Parameterized Query...")
+    // Payload that would dump all products in a string concatenation vulnerability
+    inject_sql := "SELECT id, name FROM products WHERE category = $1;"
+    var inject_params = [1]string{"Hardware' OR '1'='1"}
+    match client.query_params(&inject_sql, &inject_params[..]) {
+        Ok(res) => {
+            print("    Rows returned with injection payload: " + string.from_u64(u64(res.rows.len())))
+            if res.rows.len() == usize(0) {
+                print("    ✓ Safe! No records matched the malicious string literal.")
+            } else {
+                print("    ✗ Potential vulnerability detected!")
+            }
+        }
+        Err(e) => print("    Query error: " + e.message)
+    }
+
+    print("\n[7] Closing single client session...")
     match client.close() {
         Ok(_) => print("✓ Session terminated cleanly with Terminate ('X') packet.")
         Err(e) => print("✗ Close error: " + e.message)
     }
+
+    print("\n[8] Testing Connection Pool (Pool)...")
+    var pool = lib.Pool.new(cfg, 3)
+    print("    Acquiring client from pool...")
+    pool_query_sql := "SELECT count(*) FROM products WHERE category = $1;"
+    var cat_params = [1]string{"Hardware"}
+    match pool.query_params(&pool_query_sql, &cat_params[..]) {
+        Ok(res) => {
+            if res.rows.len() > usize(0) {
+                count_val := res.rows.get(0).get_or(0, "0")
+                print("    ✓ Pool query succeeded! Hardware items count: " + count_val)
+            }
+        }
+        Err(e) => print("    ✗ Pool query error: " + e.message)
+    }
+    pool.close()
+    print("    ✓ Connection pool closed cleanly.")
 
     print("\n==================================================")
     print("  All PostgreSQL operations executed successfully!")
