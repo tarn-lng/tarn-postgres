@@ -22,28 +22,28 @@ fn main() {
         }
     }
 
-    print("\n[1] Creating 'products' table...")
-    drop_sql := "DROP TABLE IF EXISTS products;"
+    print("\n[1] Creating 'driver_test_products' table...")
+    drop_sql := "DROP TABLE IF EXISTS driver_test_products;"
     match client.execute(&drop_sql) {
         Ok(tag) => print("    " + tag)
         Err(e)  => print("    Error: " + e.message)
     }
 
-    create_sql := "CREATE TABLE products (id SERIAL PRIMARY KEY, name TEXT NOT NULL, category TEXT, price NUMERIC(10,2));"
+    create_sql := "CREATE TABLE driver_test_products (id SERIAL PRIMARY KEY, name TEXT NOT NULL, category TEXT, price NUMERIC(10,2));"
     match client.execute(&create_sql) {
         Ok(tag) => print("    " + tag)
         Err(e)  => print("    Error: " + e.message)
     }
 
     print("\n[2] Inserting inventory rows...")
-    insert_sql := "INSERT INTO products (name, category, price) VALUES ('Mechanical Keyboard', 'Hardware', 129.99), ('27-inch 4K Monitor', 'Hardware', 349.50), ('USB-C Hub', 'Accessories', 39.95), ('Noise Cancelling Headphones', 'Audio', 199.00), ('Desk Pad', 'Accessories', 19.99);"
+    insert_sql := "INSERT INTO driver_test_products (name, category, price) VALUES ('Mechanical Keyboard', 'Hardware', 129.99), ('27-inch 4K Monitor', 'Hardware', 349.50), ('USB-C Hub', 'Accessories', 39.95), ('Noise Cancelling Headphones', 'Audio', 199.00), ('Desk Pad', 'Accessories', 19.99);"
     match client.execute(&insert_sql) {
         Ok(tag) => print("    " + tag)
         Err(e)  => print("    Error: " + e.message)
     }
 
-    print("\n[3] Querying filtered products (price > 40.00)...")
-    select_sql := "SELECT id, name, category, price FROM products WHERE price > 40.00 ORDER BY price DESC;"
+    print("\n[3] Querying filtered driver_test_products (price > 40.00)...")
+    select_sql := "SELECT id, name, category, price FROM driver_test_products WHERE price > 40.00 ORDER BY price DESC;"
     match client.query(&select_sql) {
         Ok(res) => {
             print("    Rows returned: " + string.from_u64(u64(res.rows.len())))
@@ -63,7 +63,7 @@ fn main() {
     }
 
     print("\n[4] Running aggregation query...")
-    agg_sql := "SELECT count(*) AS total_count, min(price) AS min_price, max(price) AS max_price FROM products;"
+    agg_sql := "SELECT count(*) AS total_count, min(price) AS min_price, max(price) AS max_price FROM driver_test_products;"
     match client.query(&agg_sql) {
         Ok(res) => {
             if res.rows.len() > usize(0) {
@@ -80,7 +80,7 @@ fn main() {
     }
 
     print("\n[5] Testing Parameterized Query ($1, $2, $3)...")
-    insert_param_sql := "INSERT INTO products (name, category, price) VALUES ($1, $2, $3) RETURNING id, name;"
+    insert_param_sql := "INSERT INTO driver_test_products (name, category, price) VALUES ($1, $2, $3) RETURNING id, name;"
     var ins_params = [3]string{"UltraWide Monitor", "Hardware", "499.99"}
     match client.query_params(&insert_param_sql, &ins_params[..]) {
         Ok(res) => {
@@ -93,8 +93,8 @@ fn main() {
     }
 
     print("\n[6] Testing SQL Injection immunity via Parameterized Query...")
-    // Payload that would dump all products in a string concatenation vulnerability
-    inject_sql := "SELECT id, name FROM products WHERE category = $1;"
+    // Payload that would dump all driver_test_products in a string concatenation vulnerability
+    inject_sql := "SELECT id, name FROM driver_test_products WHERE category = $1;"
     var inject_params = [1]string{"Hardware' OR '1'='1"}
     match client.query_params(&inject_sql, &inject_params[..]) {
         Ok(res) => {
@@ -120,7 +120,7 @@ fn main() {
         Ok(p) => {
             var pool = p
             print("    Acquiring client from pool...")
-            pool_query_sql := "SELECT count(*) FROM products WHERE category = $1;"
+            pool_query_sql := "SELECT count(*) FROM driver_test_products WHERE category = $1;"
             var cat_params = [1]string{"Hardware"}
             match pool.query_params(&pool_query_sql, &cat_params[..]) {
                 Ok(res) => {
