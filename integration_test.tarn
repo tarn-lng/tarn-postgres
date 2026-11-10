@@ -1,0 +1,77 @@
+import "lib"
+import "os"
+import "io"
+
+fn require(ok bool, message &string) {
+    if !ok { panic(message.clone()) }
+}
+fn rollback_case(db &mut lib.Client) Result<void, lib.Error> {
+    _result1 := try db.execute("INSERT INTO registry_test VALUES (10)")
+    return Err(lib.Error.new(lib.ErrorKind.QueryFailed, "intentional rollback"))
+}
+fn commit_case(db &mut lib.Client) Result<void, lib.Error> {
+    _result2 := try db.execute("INSERT INTO registry_test VALUES (20)")
+    return Ok(())
+}
+fn failed(cfg lib.Config) {
+    match lib.Client.connect(cfg) { Ok(c) => { panic("bad connection accepted") }
+        Err(e) => {} }
+}
+fn run(url &string, cert &string) Result<void, lib.Error> {
+    cfg := try lib.Config.from_url(url)
+    var db = try lib.Client.connect(cfg.clone().with_ca_file(cert.clone()))
+    ssl := try db.query("SELECT ssl::text FROM pg_stat_ssl WHERE pid = pg_backend_pid()")
+    require(ssl.rows.len() == 1 && ssl.rows.get(0).get_or(0, "") == "true", "session must use TLS")
+    args := [1]string{"quote'; SELECT 99; --"}
+    value := try db.query_params("SELECT $1::text", &args)
+    require(value.rows.len() == 1 && value.rows.get(0).get_or(0, "") == args[0], "bind parameter changed")
+    match db.execute("SELECT no_such_column") { Err(e) => {}
+        Ok(_) => { panic("invalid SQL succeeded") } }
+    res := try db.query("SELECT 42")
+    require(res.rows.get(0).get_or(0, "") == "42", "simple query error did not drain ReadyForQuery")
+    empty := [0]string{}
+    match db.query_params("SELECT no_such_column", &empty) { Err(e) => {}
+        Ok(_) => { panic("invalid extended SQL succeeded") } }
+    _result3 := try db.query_params("SELECT 1", &empty)
+    _result4 := try db.execute("CREATE TEMP TABLE registry_test (value integer)")
+    match db.transaction(rollback_case) { Err(e) => {}
+        Ok(_) => { panic("transaction callback error swallowed") } }
+    count := try db.query("SELECT count(*) FROM registry_test")
+    require(count.rows.get(0).get_or(0, "") == "0", "callback error did not roll back")
+    try db.transaction(commit_case)
+    count2 := try db.query("SELECT count(*) FROM registry_test")
+    require(count2.rows.get(0).get_or(0, "") == "1", "transaction did not commit")
+    try db.begin()
+    match db.execute("SELECT no_such_column") { Err(e) => {}
+        Ok(_) => { panic("invalid SQL succeeded in transaction") } }
+    require(db.status == 69, "failed transaction status not received")
+    match db.commit() { Err(e) => {}
+        Ok(_) => { panic("COMMIT silently reported success on aborted transaction") } }
+    try db.rollback()
+    _result5 := try db.query("SELECT 1")
+    try db.close()
+    failed(cfg.clone().with_ca_file(cert.clone()).with_password("wrong-password"))
+    failed(cfg.clone()) // untrusted self-signed certificate
+    var wrong_host = cfg.clone().with_ca_file(cert.clone())
+    wrong_host.host = "127.0.0.1"
+    failed(wrong_host)
+    var pool = lib.Pool.new(cfg.clone().with_ca_file(cert.clone()), 1)
+    var first = try pool.acquire()
+    try first.begin()
+    pool.release(first) // active transactions must never be reused
+    var second = try pool.acquire()
+    require(second.status == 73, "pool returned an active transaction")
+    _result6 := try second.query("SELECT 1")
+    pool.release(second)
+    pool.close()
+    print("PostgreSQL TLS + SCRAM + parameters + transactions passed")
+    return Ok(())
+}
+fn main() Result<void, io.Error> {
+    args := try os.args()
+    match run(args.get(1), args.get(2)) {
+        Ok(_) => { return Ok(()) }
+        Err(e) => { print("FAIL: " + e.message)
+            return Err(io.Error.new(io.ErrorKind.OtherOs)) }
+    }
+}

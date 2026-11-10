@@ -1,0 +1,92 @@
+// RFC 5802 / RFC 7677 SCRAM-SHA-256. No password or challenge is logged.
+import "crypto"
+import "encoding"
+import "string"
+import "ffi"
+extern "C" fn getrandom(buffer *mut u8, length usize, flags u32) i64
+
+pub fn hmac(key &[]u8, message &[]u8) [32]u8 { return crypto.hmac_sha256(key, message) }
+pub fn equal(a &[]u8, b &[]u8) bool { return crypto.equal_bytes(a, b) }
+pub fn nonce() Result<string, string> {
+    var bytes = [24]u8{0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0}
+    var offset = usize(0)
+    for offset < 24 {
+        var count = i64(0)
+        unsafe { count = getrandom(ffi.slice_mut(&mut bytes[offset..]), 24 - offset, 0) }
+        if count <= 0 { return Err("Secure random unavailable") }
+        offset = offset + usize(count)
+    }
+    return Ok(encoding.base64_encode(&bytes))
+}
+pub struct Proof { pub response string
+    pub server_signature string }
+
+pub fn prove(password &string, client_nonce &string, challenge &string) Result<Proof, string> {
+    // PostgreSQL applies SASLprep, falling back to the original password for
+    // invalid UTF-8/prohibited strings. Unicode normalization is not available
+    // in Tarn yet: reject non-ASCII instead of silently authenticating wrongly.
+    for b in password.bytes() {
+        if b < 32 || b > 126 { return Err("SCRAM currently requires an ASCII password") }
+    }
+    if password.len() > 1024 || challenge.len() > 8192 { return Err("SCRAM input limit exceeded") }
+    var server_nonce = ""
+    var salt_text = ""
+    var iterations = u64(0)
+    if client_nonce.len() < 20 || client_nonce.len() > 128 { return Err("Invalid SCRAM client nonce") }
+    fields := string.split(challenge, ",")
+    if fields.len() != 3 { return Err("SCRAM requires exactly r, s and i attributes") }
+    for field in fields.as_slice() {
+        if string.starts_with(field, "r=") {
+            if server_nonce.len() != 0 { return Err("Duplicate SCRAM nonce") }
+            match string.slice(field, 2, field.len()) { Some(s) => { server_nonce = s }
+                None => { return Err("Invalid SCRAM nonce") } }
+        } else {
+            if string.starts_with(field, "s=") {
+                if salt_text.len() != 0 { return Err("Duplicate SCRAM salt") }
+                match string.slice(field, 2, field.len()) { Some(s) => { salt_text = s }
+                    None => { return Err("Invalid SCRAM salt") } }
+            } else {
+                if string.starts_with(field, "i=") {
+                    if iterations != 0 { return Err("Duplicate SCRAM iterations") }
+                    match string.slice(field, 2, field.len()) {
+                        Some(s) => match string.parse_u64(&s) { Some(n) => { iterations = n }
+                            None => { return Err("Invalid SCRAM iterations") } }
+                        None => { return Err("Invalid SCRAM iterations") }
+                    }
+                } else { return Err("Unsupported SCRAM attribute") }
+            }
+        }
+    }
+    if !string.starts_with(&server_nonce, client_nonce) || server_nonce.len() <= client_nonce.len() {
+        return Err("Server SCRAM nonce does not extend client nonce")
+    }
+    if iterations < 4096 || iterations > 100000 { return Err("SCRAM iteration count outside 4096..100000") }
+    salt := try encoding.base64_decode(&salt_text, 1024).map_err(fn(e encoding.Base64Error) string { return "Invalid SCRAM salt" })
+    if salt.len() < 8 { return Err("SCRAM salt too short") }
+    var input: Vec<u8> = Vec.new()
+    input.extend_from_slice(salt.as_slice())
+    input.push(0)
+    input.push(0)
+    input.push(0)
+    input.push(1)
+    var u = hmac(password.bytes(), input.as_slice())
+    var salted = u
+    var round = u64(1)
+    for round < iterations {
+        u = hmac(password.bytes(), &u)
+        for i in 0..32 { salted[i] = salted[i] ^ u[i] }
+        round = round + 1
+    }
+    client_key := hmac(&salted, "Client Key".bytes())
+    stored_key := crypto.sha256(&client_key)
+    bare := "n=,r=" + client_nonce
+    final := "c=biws,r=" + &server_nonce
+    auth_message := bare + "," + challenge + "," + &final
+    signature := hmac(&stored_key, auth_message.bytes())
+    var proof = client_key
+    for i in 0..32 { proof[i] = proof[i] ^ signature[i] }
+    server_key := hmac(&salted, "Server Key".bytes())
+    server_signature := hmac(&server_key, auth_message.bytes())
+    return Ok(Proof{response: final + ",p=" + &encoding.base64_encode(&proof),
+        server_signature: "v=" + &encoding.base64_encode(&server_signature)})
+}

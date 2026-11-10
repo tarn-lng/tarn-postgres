@@ -1,0 +1,26 @@
+import "lib"
+import "os"
+import "io"
+fn main() Result<void, io.Error> {
+    args := try os.args()
+    match lib.Client.connect_url(args.get(1)) {
+        Err(e) => {
+            if args.get(2) != "connect" { panic("unexpected connection failure") }
+        }
+        Ok(db) => {
+            var client = db
+            if args.get(2) == "connect" { panic("hostile authentication accepted") }
+            match client.query("SELECT 1") {
+                Ok(_) => { panic("malformed query response accepted") }
+                Err(e) => {}
+            }
+            if client.status != 0 { panic("malformed connection is reusable") }
+            match client.query("SELECT 2") {
+                Ok(_) => { panic("poisoned connection reused") }
+                Err(e) => {}
+            }
+        }
+    }
+    print("rejected")
+    return Ok(())
+}

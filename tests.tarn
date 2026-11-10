@@ -1,0 +1,31 @@
+import "testing"
+import "lib"
+import "scram"
+import "encoding"
+fn test_hmac_standard_and_long_key_vectors(t &mut testing.T) {
+    digest:=scram.hmac("key".bytes(),"The quick brown fox jumps over the lazy dog".bytes())
+    t.eq(encoding.hex(&digest),"f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8")
+    var key:Vec<u8> = Vec.new()
+    for i in 0..131 {key.push(170)}
+    long:=scram.hmac(key.as_slice(),"Test Using Larger Than Block-Size Key - Hash Key First".bytes())
+    t.eq(encoding.hex(&long),"60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54")
+}
+fn test_scram_rfc_7677_client_and_server_proofs(t &mut testing.T) {
+    proof:=scram.prove("pencil","rOprNGfwEbeRWgbNEkqO","r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096").unwrap()
+    t.eq(proof.response,"c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=qvT2SWdEH5Q06albL+hjSYuUhCG7VndFyzIb7CK4n9k=")
+    t.eq(proof.server_signature,"v=3HO6Qt1M4MKJrmlKaoOqLAI0/0TV0HZe7J9H3MBtSOg=")
+}
+fn test_scram_refuses_nonce_mismatch_and_unbounded_iterations(t &mut testing.T) {
+    t.err(&scram.prove("pencil","rOprNGfwEbeRWgbNEkqO","r=wrongnonce,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"))
+    t.err(&scram.prove("pencil","rOprNGfwEbeRWgbNEkqO","r=rOprNGfwEbeRWgbNEkqOextra,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=100001"))
+}
+fn test_database_url_security_options_are_not_substring_matches(t &mut testing.T) {
+    t.err(&lib.Config.from_url("postgresql://u:p@localhost/db?sslmode=require&sslmode=disable"))
+    t.err(&lib.Config.from_url("postgresql://u:p@localhost/db?not_sslmode=disable"))
+    t.err(&lib.Config.from_url("postgresql://u:p%00@localhost/db?sslmode=require"))
+    t.err(&lib.Config.from_url("postgresql://u:p@localhost:65536/db?sslmode=require"))
+    cfg:=lib.Config.from_url("postgresql://user:p%40ss%3Aword@[::1]:5433/db?sslmode=verify-full").unwrap()
+    t.eq(cfg.password,"p@ss:word")
+    t.eq(cfg.host,"[::1]")
+    t.eq(cfg.port,u16(5433))
+}

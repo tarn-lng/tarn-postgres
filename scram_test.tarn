@@ -1,0 +1,57 @@
+import "scram"
+import "encoding"
+import "lib"
+fn require(ok bool, message &string) { if !ok { panic(message.clone()) } }
+fn reject_challenge(challenge &string) {
+    match scram.prove("pencil", "rOprNGfwEbeRWgbNEkqO", challenge) {
+        Ok(p) => { panic("invalid SCRAM challenge accepted") }
+        Err(e) => {}
+    }
+}
+fn reject_url(url &string) {
+    match lib.Config.from_url(url) { Ok(c) => { panic("invalid URL accepted") }
+        Err(e) => {} }
+}
+fn main() {
+    actual := scram.hmac("key".bytes(), "The quick brown fox jumps over the lazy dog".bytes())
+    require(encoding.hex(&actual) == "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8", "HMAC vector")
+    var long_key: Vec<u8> = Vec.new()
+    for i in 0..131 { long_key.push(170) }
+    long_mac := scram.hmac(long_key.as_slice(), "Test Using Larger Than Block-Size Key - Hash Key First".bytes())
+    require(encoding.hex(&long_mac) == "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54", "HMAC long-key vector")
+    match scram.prove("pencil", "rOprNGfwEbeRWgbNEkqO", "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096") {
+        Ok(proof) => {
+            require(proof.response == "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=qvT2SWdEH5Q06albL+hjSYuUhCG7VndFyzIb7CK4n9k=", "RFC 7677 client proof")
+            require(proof.server_signature == "v=3HO6Qt1M4MKJrmlKaoOqLAI0/0TV0HZe7J9H3MBtSOg=", "RFC 7677 server signature")
+        }
+        Err(e) => { panic(e) }
+    }
+    reject_challenge("r=wrongnonce,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096")
+    reject_challenge("r=rOprNGfwEbeRWgbNEkqO,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096")
+    reject_challenge("r=rOprNGfwEbeRWgbNEkqOextra,s=bad!,i=4096")
+    reject_challenge("r=rOprNGfwEbeRWgbNEkqOextra,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=1")
+    reject_challenge("r=rOprNGfwEbeRWgbNEkqOextra,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=100001")
+    reject_challenge("r=rOprNGfwEbeRWgbNEkqOextra,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096,i=4096")
+    reject_url("postgresql://u:p@localhost/db?sslmode=require&sslmode=disable")
+    reject_url("postgresql://u:p@localhost/db?not_sslmode=disable")
+    reject_url("postgresql://u:p@localhost/db?sslmode=unknown")
+    reject_url("postgresql://u:p%ZZ@localhost/db?sslmode=require")
+    reject_url("postgresql://u:p%00@localhost/db?sslmode=require")
+    reject_url("postgresql://u:p@localhost/db?channel_binding=require")
+    reject_url("postgresql://u:p@localhost:65536/db?sslmode=require")
+    reject_url("postgresql://u:p@localhost:abc/db?sslmode=require")
+    reject_url("postgresql://u:p@localhost:/db?sslmode=require")
+    reject_url("postgresql://u:p@/db?sslmode=require")
+    match lib.Config.from_url("postgresql://u:p@[::1]:5433/db?sslmode=require") {
+        Ok(c) => { require(c.host == "[::1]" && c.port == 5433, "bracketed IPv6 authority") }
+        Err(e) => { panic(e.message) }
+    }
+    match lib.Config.from_url("postgresql://user:p%40ss%3Aword@localhost/db?sslmode=verify-full") {
+        Ok(c) => { require(c.password == "p@ss:word", "URL credential decoding") }
+        Err(e) => { panic(e.message) }
+    }
+    require(scram.equal("same".bytes(), "same".bytes()), "comparison equal")
+    require(!scram.equal("same".bytes(), "samo".bytes()), "comparison differs")
+    require(!scram.equal("same".bytes(), "same!".bytes()), "comparison length")
+    print("SCRAM RFC vectors, HMAC, hostile challenges and URL options passed")
+}

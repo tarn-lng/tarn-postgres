@@ -5,9 +5,11 @@
 import "net"
 import "io"
 import "string"
+import "scram"
 
 pub copy enum ErrorKind {
     ConnectionFailed
+    PoolExhausted
     AuthFailed
     QueryFailed
     ProtocolError
@@ -36,6 +38,8 @@ pub struct Config {
     pub password string
     pub database string
     pub ssl_mode SslMode
+    pub ca_file string
+    pub connect_timeout_millis u64
 }
 
 pub fn Config.new(host string, port u16, user string, password string, database string) Config {
@@ -45,7 +49,8 @@ pub fn Config.new(host string, port u16, user string, password string, database 
         user: user,
         password: password,
         database: database,
-        ssl_mode: SslMode.Prefer
+        ssl_mode: SslMode.Prefer,
+        ca_file: "", connect_timeout_millis: 10000
     }
 }
 
@@ -56,7 +61,8 @@ pub fn Config.default() Config {
         user: "postgres",
         password: "",
         database: "testdb",
-        ssl_mode: SslMode.Prefer
+        ssl_mode: SslMode.Prefer,
+        ca_file: "", connect_timeout_millis: 10000
     }
 }
 
@@ -67,7 +73,8 @@ pub fn Config.clone(&self) Config {
         user: self.user.clone(),
         password: self.password.clone(),
         database: self.database.clone(),
-        ssl_mode: self.ssl_mode
+        ssl_mode: self.ssl_mode,
+        ca_file: self.ca_file.clone(), connect_timeout_millis: self.connect_timeout_millis
     }
 }
 
@@ -80,6 +87,46 @@ pub fn Config.with_password(self, password string) Config {
 pub fn Config.with_ssl_mode(self, mode SslMode) Config {
     var c = self
     c.ssl_mode = mode
+    return c
+}
+
+fn hex_digit(byte u8) Option<u8> {
+    if byte >= 48 && byte <= 57 { return Some(byte - 48) }
+    if byte >= 65 && byte <= 70 { return Some(byte - 55) }
+    if byte >= 97 && byte <= 102 { return Some(byte - 87) }
+    return None
+}
+fn decode_url(value &string) Result<string, Error> {
+    var bytes: Vec<u8> = Vec.new()
+    var at = usize(0)
+    for at < value.len() {
+        var byte = value.bytes()[at]
+        if byte == 37 {
+            if at + 2 >= value.len() { return Err(Error.new(ErrorKind.ConnectionFailed, "Malformed URL escape")) }
+            var high = u8(0)
+            var low = u8(0)
+            match hex_digit(value.bytes()[at + 1]) { Some(n) => { high = n }
+                None => { return Err(Error.new(ErrorKind.ConnectionFailed, "Malformed URL escape")) } }
+            match hex_digit(value.bytes()[at + 2]) { Some(n) => { low = n }
+                None => { return Err(Error.new(ErrorKind.ConnectionFailed, "Malformed URL escape")) } }
+            byte = high * 16 + low
+            at = at + 2
+        }
+        if byte == 0 { return Err(Error.new(ErrorKind.ConnectionFailed, "NUL in PostgreSQL URL")) }
+        bytes.push(byte)
+        at = at + 1
+    }
+    match string.from_utf8(bytes.as_slice()) { Some(s) => { return Ok(s) }
+        None => { return Err(Error.new(ErrorKind.ConnectionFailed, "URL must decode to UTF-8")) } }
+}
+pub fn Config.with_ca_file(self, file string) Config {
+    var c = self
+    c.ca_file = file
+    return c
+}
+pub fn Config.with_connect_timeout(self, millis u64) Config {
+    var c = self
+    c.connect_timeout_millis = millis
     return c
 }
 
@@ -170,39 +217,91 @@ pub fn Config.from_url(url &string) Result<Config, Error> {
     }
 
     host_port_str := slice_str(url, host_start, auth_end)
-    var host_name = "127.0.0.1"
-    var port_num = u16(5432)
-    match find_char(&host_port_str, 0, 58) { // ':'
-        Some(colon_idx) => {
-            h := slice_str(&host_port_str, 0, colon_idx)
-            if h.len() > 0 {
-                host_name = h
+    var host_name = ""
+    var port_text = ""
+    if string.starts_with(&host_port_str, "[") {
+        match find_char(&host_port_str, 1, 93) {
+            Some(end) => {
+                host_name = slice_str(&host_port_str, 0, end + 1)
+                if end + 1 < host_port_str.len() {
+                    if host_port_str.bytes()[end + 1] != 58 { return Err(Error.new(ErrorKind.ConnectionFailed, "Invalid IPv6 authority")) }
+                    port_text = slice_str(&host_port_str, end + 2, host_port_str.len())
+                    if port_text.len() == 0 { return Err(Error.new(ErrorKind.ConnectionFailed, "Missing port")) }
+                }
             }
-            p_str := slice_str(&host_port_str, colon_idx + 1, host_port_str.len())
-            match string.parse_u64(&p_str) {
-                Some(p_val) => { port_num = u16(p_val) }
-                None => {}
-            }
+            None => { return Err(Error.new(ErrorKind.ConnectionFailed, "Unclosed IPv6 authority")) }
         }
-        None => {
-            if host_port_str.len() > 0 {
-                host_name = host_port_str
+    } else {
+        pair := string.split(&host_port_str, ":")
+        if pair.len() > 2 { return Err(Error.new(ErrorKind.ConnectionFailed, "IPv6 hosts must be bracketed")) }
+        host_name = pair.get(0).clone()
+        if pair.len() == 2 {
+            port_text = pair.get(1).clone()
+            if port_text.len() == 0 { return Err(Error.new(ErrorKind.ConnectionFailed, "Missing port")) }
+        }
+    }
+    if host_name.len() == 0 { return Err(Error.new(ErrorKind.ConnectionFailed, "Missing PostgreSQL host")) }
+    var port_num = u16(5432)
+    if port_text.len() > 0 {
+        match string.parse_u64(&port_text) {
+            Some(port) => {
+                if port == 0 || port > 65535 { return Err(Error.new(ErrorKind.ConnectionFailed, "Port outside 1..65535")) }
+                port_num = u16(port)
             }
+            None => { return Err(Error.new(ErrorKind.ConnectionFailed, "Invalid PostgreSQL port")) }
+        }
+    }
+    for byte in host_name.bytes() {
+        if byte <= 32 || byte == 127 || byte == 35 || byte == 37 || byte == 63 || byte == 64 || byte == 92 {
+            return Err(Error.new(ErrorKind.ConnectionFailed, "Invalid PostgreSQL host"))
         }
     }
 
     var ssl_mode = SslMode.Prefer
+    var ca_file = ""
+    var connect_timeout = u64(10000)
     if query_start > 0 {
         query_str := slice_str(url, query_start, url.len())
-        if query_str.len() > 0 {
-            if string.contains(&query_str, &"sslmode=disable") || string.contains(&query_str, &"ssl=false") || string.contains(&query_str, &"ssl=0") {
-                ssl_mode = SslMode.Disable
+        fields := string.split(&query_str, "&")
+        var saw_ssl = false
+        var saw_ca = false
+        var saw_timeout = false
+        var saw_binding = false
+        for field in fields.as_slice() {
+            pair := string.split(field, "=")
+            if pair.len() != 2 { return Err(Error.new(ErrorKind.ConnectionFailed, "Malformed PostgreSQL URL option")) }
+            key := pair.get(0)
+            value := try decode_url(pair.get(1))
+            if key == "sslmode" {
+                if saw_ssl { return Err(Error.new(ErrorKind.ConnectionFailed, "Duplicate sslmode")) }
+                saw_ssl = true
+                if value == "disable" { ssl_mode = SslMode.Disable } else {
+                    if value == "prefer" { ssl_mode = SslMode.Prefer } else {
+                        if value == "require" || value == "verify-full" { ssl_mode = SslMode.Require } else {
+                            return Err(Error.new(ErrorKind.ConnectionFailed, "Unsupported sslmode"))
+                        }
+                    }
+                }
             } else {
-                if string.contains(&query_str, &"sslmode=require") || string.contains(&query_str, &"ssl=true") {
-                    ssl_mode = SslMode.Require
+                if key == "sslrootcert" {
+                    if saw_ca { return Err(Error.new(ErrorKind.ConnectionFailed, "Duplicate sslrootcert")) }
+                    saw_ca = true
+                    ca_file = value
                 } else {
-                    if string.contains(&query_str, &"sslmode=prefer") {
-                        ssl_mode = SslMode.Prefer
+                    if key == "connect_timeout" {
+                        if saw_timeout { return Err(Error.new(ErrorKind.ConnectionFailed, "Duplicate connect_timeout")) }
+                        saw_timeout = true
+                        match string.parse_u64(&value) { Some(n) => {
+                            if n == 0 || n > 300 { return Err(Error.new(ErrorKind.ConnectionFailed, "connect_timeout must be 1..300 seconds")) }
+                            connect_timeout = n * 1000
+                        }
+                            None => { return Err(Error.new(ErrorKind.ConnectionFailed, "Invalid connect_timeout")) } }
+                    } else {
+                        if key == "channel_binding" {
+                            if saw_binding { return Err(Error.new(ErrorKind.ConnectionFailed, "Duplicate channel_binding")) }
+                            saw_binding = true
+                            if value != "prefer" && value != "disable" { return Err(Error.new(ErrorKind.ConnectionFailed, "SCRAM channel binding is not yet supported")) }
+                        } else { return Err(Error.new(ErrorKind.ConnectionFailed, "Unsupported PostgreSQL URL option")) }
                     }
                 }
             }
@@ -212,10 +311,11 @@ pub fn Config.from_url(url &string) Result<Config, Error> {
     return Ok(Config{
         host: host_name,
         port: port_num,
-        user: user_name,
-        password: password,
-        database: db_name,
-        ssl_mode: ssl_mode
+        user: try decode_url(&user_name),
+        password: try decode_url(&password),
+        database: try decode_url(&db_name),
+        ssl_mode: ssl_mode,
+        ca_file: ca_file, connect_timeout_millis: connect_timeout
     })
 }
 
@@ -255,12 +355,67 @@ pub fn QueryResult.len(&self) usize {
     return self.rows.len()
 }
 
+enum Stream {
+    Plain(net.TcpStream)
+    Tls(net.TlsStream)
+}
+fn Stream.read(&mut self, bytes &mut []u8) Result<usize, io.Error> {
+    match self {
+        Stream.Plain(s) => { return s.read(bytes) }
+        Stream.Tls(s) => { return s.read(bytes) }
+    }
+}
+fn Stream.write_all(&mut self, bytes &[]u8) Result<void, io.Error> {
+    match self {
+        Stream.Plain(s) => { return s.write_all(bytes) }
+        Stream.Tls(s) => { return s.write_all(bytes) }
+    }
+}
+fn Stream.close(self) Result<void, io.Error> {
+    match self {
+        Stream.Plain(s) => { return s.close() }
+        Stream.Tls(s) => { return s.close() }
+    }
+}
+fn encrypted(config &Config) Result<Stream, Error> {
+    var options = net.TlsOptions.new()
+    options.ca_file = config.ca_file.clone()
+    options.timeout_millis = config.connect_timeout_millis
+    address := config.host + ":" + &string.from_u64(u64(config.port))
+    tls := try net.TlsStream.connect_postgres(&address, &options)
+        .map_err(fn(e io.Error) Error { return Error.new(ErrorKind.ConnectionFailed, "Verified PostgreSQL TLS connection failed (native code " + &string.from_i64(i64(e.native_code())) + ")") })
+    return Ok(Stream.Tls(tls))
+}
+fn connect_stream(config &Config) Result<Stream, Error> {
+    match config.ssl_mode { SslMode.Require => { return encrypted(config) }
+        _ => {} }
+    address := config.host + ":" + &string.from_u64(u64(config.port))
+    tcp := try net.TcpStream.connect(&address)
+        .map_err(fn(e io.Error) Error { return Error.new(ErrorKind.ConnectionFailed, "PostgreSQL TCP connection failed") })
+    var plain = Stream.Plain(tcp)
+    match config.ssl_mode {
+        SslMode.Disable => { return Ok(plain) }
+        _ => {}
+    }
+    // Compatibility for servers without SSL. No startup/credentials are sent
+    // during this probe. If SSL is offered, reconnect through the TLS transport;
+    // certificate or handshake failure can never downgrade to plaintext.
+    request := [8]u8{0,0,0,8,4,210,22,47}
+    try plain.write_all(&request).map_err(fn(e io.Error) Error { return Error.new(ErrorKind.ConnectionFailed, "SSLRequest write failed") })
+    var answer = [1]u8{0}
+    try read_exact(&mut plain, &mut answer).map_err(fn(e io.Error) Error { return Error.new(ErrorKind.ConnectionFailed, "SSLRequest read failed") })
+    if answer[0] == 78 { return Ok(plain) }
+    if answer[0] != 83 { return Err(Error.new(ErrorKind.ProtocolError, "Invalid SSLRequest response")) }
+    _ := plain.close()
+    return encrypted(config)
+}
+
 pub struct Client {
-    stream     net.TcpStream
+    stream     Stream
     pub status u8
 }
 
-fn read_exact(stream &mut net.TcpStream, target &mut []u8) Result<void, io.Error> {
+fn read_exact(stream &mut Stream, target &mut []u8) Result<void, io.Error> {
     var total = usize(0)
     for total < target.len() {
         n := try stream.read(&mut target[total..target.len()])
@@ -272,15 +427,16 @@ fn read_exact(stream &mut net.TcpStream, target &mut []u8) Result<void, io.Error
     return Ok(())
 }
 
-fn read_u32(stream &mut net.TcpStream) Result<usize, io.Error> {
+fn read_u32(stream &mut Stream) Result<usize, io.Error> {
     var buf = [4]u8{0, 0, 0, 0}
     try read_exact(stream, &mut buf)
     val := usize(buf[0]) * 16777216 + usize(buf[1]) * 65536 + usize(buf[2]) * 256 + usize(buf[3])
     return Ok(val)
 }
 
-fn read_message(stream &mut net.TcpStream) Result<Vec<u8>, io.Error> {
+fn read_message(stream &mut Stream) Result<Vec<u8>, io.Error> {
     len := try read_u32(stream)
+    if len < 4 || len > 16777216 { return Err(io.Error.new(io.ErrorKind.InvalidData)) }
     payload_len := len - usize(4)
     var payload: Vec<u8> = Vec.new()
     var chunk = [64]u8{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
@@ -330,46 +486,14 @@ pub fn Client.connect_url(url &string) Result<Client, Error> {
 }
 
 pub fn Client.connect(config Config) Result<Client, Error> {
-    addr := config.host + ":" + string.from_u64(u64(config.port))
-    var stream: net.TcpStream
-    match net.TcpStream.connect(&addr) {
-        Ok(s) => { stream = s }
-        Err(e) => { return Err(Error.new(ErrorKind.ConnectionFailed, "Failed to connect to host: " + addr)) }
+    if config.host.len() == 0 || config.port == 0 || config.user.len() == 0 || config.database.len() == 0 ||
+        config.connect_timeout_millis == 0 || config.connect_timeout_millis > 300000 {
+        return Err(Error.new(ErrorKind.ConnectionFailed, "Invalid PostgreSQL connection configuration"))
     }
-
-    match config.ssl_mode {
-        SslMode.Disable => {}
-        _ => {
-            // Send SSLRequest: Int32(8) + Int32(80877103)
-            var ssl_req: Vec<u8> = Vec.new()
-            push_u32_be(&mut ssl_req, 8)
-            ssl_req.push(4)
-            ssl_req.push(210)
-            ssl_req.push(22)
-            ssl_req.push(47)
-
-            match stream.write_all(ssl_req.as_slice()) {
-                Ok(_) => {}
-                Err(e) => { return Err(Error.new(ErrorKind.ConnectionFailed, "Failed sending SSLRequest")) }
-            }
-
-            var ssl_resp = [1]u8{0}
-            match read_exact(&mut stream, &mut ssl_resp) {
-                Ok(_) => {}
-                Err(e) => { return Err(Error.new(ErrorKind.ProtocolError, "Failed reading SSL response")) }
-            }
-
-            if ssl_resp[0] == u8(78) { // 'N' - SSL not supported by server
-                match config.ssl_mode {
-                    SslMode.Require => {
-                        _ := stream.close()
-                        return Err(Error.new(ErrorKind.ConnectionFailed, "PostgreSQL server does not support SSL, but ssl_mode is set to Require"))
-                    }
-                    _ => {}
-                }
-            }
-        }
+    for field in [3]string{config.user.clone(), config.database.clone(), config.password.clone()} {
+        for byte in field.bytes() { if byte == 0 { return Err(Error.new(ErrorKind.ConnectionFailed, "NUL in PostgreSQL startup field")) } }
     }
+    var stream = try connect_stream(&config)
 
     // Build Protocol 3.0 StartupMessage
     user_bytes := string.bytes(&config.user)
@@ -400,6 +524,12 @@ pub fn Client.connect(config Config) Result<Client, Error> {
     }
 
     var type_buf = [1]u8{0}
+    var authenticated = false
+    var sasl_started = false
+    var sasl_proved = false
+    var sasl_verified = false
+    var client_nonce = ""
+    var server_signature = ""
     var ready = false
     var tx_status = u8(73) // 'I'
 
@@ -442,12 +572,15 @@ pub fn Client.connect(config Config) Result<Client, Error> {
         }
 
         if m_type == u8(82) { // 'R' Authentication
+            if payload.len() < 4 { return Err(Error.new(ErrorKind.ProtocolError, "Truncated authentication message")) }
             if payload.len() >= usize(4) {
                 auth_type := usize(payload.at(0)) * 16777216 + usize(payload.at(1)) * 65536 + usize(payload.at(2)) * 256 + usize(payload.at(3))
                 if auth_type == usize(0) {
-                    // AuthenticationOk - continue
+                    if sasl_started && !sasl_verified { return Err(Error.new(ErrorKind.AuthFailed, "Missing SCRAM server signature")) }
+                    authenticated = true
                 } else {
                     if auth_type == usize(3) {
+                        if sasl_started || authenticated { return Err(Error.new(ErrorKind.ProtocolError, "Unexpected password request")) }
                         // AuthenticationCleartextPassword
                         if config.password.len() == 0 {
                             _ := stream.close()
@@ -472,13 +605,60 @@ pub fn Client.connect(config Config) Result<Client, Error> {
                             _ := stream.close()
                             return Err(Error.new(ErrorKind.AuthFailed, "Server requires MD5 password authentication (not yet supported)"))
                         } else {
-                            if auth_type == usize(10) {
-                                _ := stream.close()
-                                return Err(Error.new(ErrorKind.AuthFailed, "Server requires SCRAM-SHA-256 password authentication (not yet supported)"))
+                            if auth_type == 10 {
+                                if sasl_started || authenticated { return Err(Error.new(ErrorKind.ProtocolError, "Unexpected SASL negotiation")) }
+                                var supported = false
+                                var at = usize(4)
+                                for at < payload.len() {
+                                    start := at
+                                    for at < payload.len() && payload.at(at) != 0 { at = at + 1 }
+                                    if at >= payload.len() { return Err(Error.new(ErrorKind.ProtocolError, "Unterminated SASL mechanism")) }
+                                    match string.from_utf8(&payload.as_slice()[start..at]) {
+                                        Some(name) => { if name == "SCRAM-SHA-256" { supported = true } }
+                                        None => {}
+                                    }
+                                    at = at + 1
+                                }
+                                if !supported { return Err(Error.new(ErrorKind.AuthFailed, "Server does not offer SCRAM-SHA-256")) }
+                                client_nonce = try scram.nonce().map_err(fn(e string) Error { return Error.new(ErrorKind.AuthFailed, e) })
+                                first := "n,,n=,r=" + &client_nonce
+                                var msg: Vec<u8> = Vec.new()
+                                msg.push(112)
+                                push_u32_be(&mut msg, 4 + 14 + 4 + first.len())
+                                push_bytes(&mut msg, "SCRAM-SHA-256")
+                                msg.push(0)
+                                push_u32_be(&mut msg, first.len())
+                                push_bytes(&mut msg, &first)
+                                try stream.write_all(msg.as_slice()).map_err(fn(e io.Error) Error { return Error.new(ErrorKind.IoError, "SASL initial response failed") })
+                                sasl_started = true
                             } else {
-                                _ := stream.close()
-                                return Err(Error.new(ErrorKind.AuthFailed, "Unsupported authentication type: " + string.from_u64(u64(auth_type))))
+                                if auth_type == 11 {
+                                    if !sasl_started || sasl_proved { return Err(Error.new(ErrorKind.ProtocolError, "Unexpected SASL continue")) }
+                                    var challenge = ""
+                                    match string.from_utf8(&payload.as_slice()[4..]) {
+                                        Some(s) => { challenge = s }
+                                        None => { return Err(Error.new(ErrorKind.ProtocolError, "Invalid SASL challenge")) }
+                                    }
+                                    proof := try scram.prove(&config.password, &client_nonce, &challenge).map_err(fn(e string) Error { return Error.new(ErrorKind.AuthFailed, e) })
+                                    server_signature = proof.server_signature
+                                    var msg: Vec<u8> = Vec.new()
+                                    msg.push(112)
+                                    push_u32_be(&mut msg, 4 + proof.response.len())
+                                    push_bytes(&mut msg, &proof.response)
+                                    try stream.write_all(msg.as_slice()).map_err(fn(e io.Error) Error { return Error.new(ErrorKind.IoError, "SASL response failed") })
+                                    sasl_proved = true
+                                } else {
+                                    if auth_type == 12 {
+                                        if !sasl_proved || sasl_verified || !scram.equal(&payload.as_slice()[4..], server_signature.bytes()) {
+                                            return Err(Error.new(ErrorKind.AuthFailed, "Invalid SCRAM server signature"))
+                                        }
+                                        sasl_verified = true
+                                    } else {
+                                        return Err(Error.new(ErrorKind.AuthFailed, "Unsupported authentication type"))
+                                    }
+                                }
                             }
+
                         }
                     }
                 }
@@ -486,6 +666,10 @@ pub fn Client.connect(config Config) Result<Client, Error> {
         }
 
         if m_type == u8(90) { // 'Z' ReadyForQuery
+            if payload.len() != 1 || (payload.at(0) != 73 && payload.at(0) != 84 && payload.at(0) != 69) {
+                return Err(Error.new(ErrorKind.ProtocolError, "Invalid ReadyForQuery status"))
+            }
+            if !authenticated { return Err(Error.new(ErrorKind.AuthFailed, "ReadyForQuery before authentication")) }
             if payload.len() > usize(0) {
                 tx_status = payload.at(0)
             }
@@ -497,6 +681,9 @@ pub fn Client.connect(config Config) Result<Client, Error> {
 }
 
 pub fn Client.query(&mut self, sql &string) Result<QueryResult, Error> {
+    if self.status == 0 { return Err(Error.new(ErrorKind.ProtocolError, "Connection is not synchronized")) }
+    for byte in sql.bytes() { if byte == 0 { return Err(Error.new(ErrorKind.QueryFailed, "NUL in SQL query")) } }
+    self.status = 0 // not reusable until ReadyForQuery is received
     sql_bytes := string.bytes(sql)
     q_len := sql_bytes.len() + 5
 
@@ -514,6 +701,7 @@ pub fn Client.query(&mut self, sql &string) Result<QueryResult, Error> {
     var columns: Vec<string> = Vec.new()
     var rows: Vec<Row> = Vec.new()
     var command_tag = ""
+    var query_err = false
 
     var type_buf = [1]u8{0}
     var done = false
@@ -531,7 +719,7 @@ pub fn Client.query(&mut self, sql &string) Result<QueryResult, Error> {
         }
 
         if m_type == u8(69) { // 'E' ErrorResponse
-            return Err(Error.new(ErrorKind.QueryFailed, "Query execution error in Postgres"))
+            query_err = true
         }
 
         if m_type == u8(84) { // 'T' RowDescription
@@ -543,6 +731,7 @@ pub fn Client.query(&mut self, sql &string) Result<QueryResult, Error> {
                     for off < payload.len() && payload.at(off) != u8(0) {
                         off = off + 1
                     }
+                    if off >= payload.len() || payload.len() - off < 19 { return Err(Error.new(ErrorKind.ProtocolError, "Truncated RowDescription")) }
                     col_name_bytes := &payload.as_slice()[name_start..off]
                     match string.from_utf8(col_name_bytes) {
                         Some(name_str) => { columns.push(name_str) }
@@ -560,6 +749,7 @@ pub fn Client.query(&mut self, sql &string) Result<QueryResult, Error> {
                 var row = Row.new()
                 var off = usize(2)
                 for c in 0..num_cols {
+                    if off > payload.len() || payload.len() - off < 4 { return Err(Error.new(ErrorKind.ProtocolError, "Truncated DataRow length")) }
                     b0 := usize(payload.at(off))
                     b1 := usize(payload.at(off + 1))
                     b2 := usize(payload.at(off + 2))
@@ -569,6 +759,7 @@ pub fn Client.query(&mut self, sql &string) Result<QueryResult, Error> {
                         row.values.push("NULL")
                     } else {
                         val_len := b0 * 16777216 + b1 * 65536 + b2 * 256 + b3
+                        if val_len > payload.len() - off { return Err(Error.new(ErrorKind.ProtocolError, "Truncated DataRow value")) }
                         val_bytes := &payload.as_slice()[off..(off + val_len)]
                         match string.from_utf8(val_bytes) {
                             Some(val_str) => { row.values.push(val_str) }
@@ -589,6 +780,9 @@ pub fn Client.query(&mut self, sql &string) Result<QueryResult, Error> {
         }
 
         if m_type == u8(90) { // 'Z' ReadyForQuery
+            if payload.len() != 1 || (payload.at(0) != 73 && payload.at(0) != 84 && payload.at(0) != 69) {
+                return Err(Error.new(ErrorKind.ProtocolError, "Invalid ReadyForQuery status"))
+            }
             if payload.len() > usize(0) {
                 self.status = payload.at(0)
             }
@@ -596,6 +790,7 @@ pub fn Client.query(&mut self, sql &string) Result<QueryResult, Error> {
         }
     }
 
+    if query_err { return Err(Error.new(ErrorKind.QueryFailed, "PostgreSQL query failed")) }
     return Ok(QueryResult{
         columns: columns,
         rows: rows,
@@ -609,6 +804,10 @@ pub fn Client.execute(&mut self, sql &string) Result<string, Error> {
 }
 
 pub fn Client.query_params(&mut self, sql &string, params &[]string) Result<QueryResult, Error> {
+    if self.status == 0 { return Err(Error.new(ErrorKind.ProtocolError, "Connection is not synchronized")) }
+    if params.len() > 65535 { return Err(Error.new(ErrorKind.QueryFailed, "Too many SQL parameters")) }
+    for byte in sql.bytes() { if byte == 0 { return Err(Error.new(ErrorKind.QueryFailed, "NUL in SQL query")) } }
+    self.status = 0 // errors cannot put an unsynchronized connection back in the pool
     sql_bytes := string.bytes(sql)
 
     var msg: Vec<u8> = Vec.new()
@@ -719,6 +918,7 @@ pub fn Client.query_params(&mut self, sql &string, params &[]string) Result<Quer
                     for off < payload.len() && payload.at(off) != u8(0) {
                         off = off + 1
                     }
+                    if off >= payload.len() || payload.len() - off < 19 { return Err(Error.new(ErrorKind.ProtocolError, "Truncated RowDescription")) }
                     col_name_bytes := &payload.as_slice()[name_start..off]
                     match string.from_utf8(col_name_bytes) {
                         Some(name_str) => { columns.push(name_str) }
@@ -736,6 +936,7 @@ pub fn Client.query_params(&mut self, sql &string, params &[]string) Result<Quer
                 var row = Row.new()
                 var off = usize(2)
                 for c in 0..num_cols {
+                    if off > payload.len() || payload.len() - off < 4 { return Err(Error.new(ErrorKind.ProtocolError, "Truncated DataRow length")) }
                     b0 := usize(payload.at(off))
                     b1 := usize(payload.at(off + 1))
                     b2 := usize(payload.at(off + 2))
@@ -745,6 +946,7 @@ pub fn Client.query_params(&mut self, sql &string, params &[]string) Result<Quer
                         row.values.push("NULL")
                     } else {
                         val_len := b0 * 16777216 + b1 * 65536 + b2 * 256 + b3
+                        if val_len > payload.len() - off { return Err(Error.new(ErrorKind.ProtocolError, "Truncated DataRow value")) }
                         val_bytes := &payload.as_slice()[off..(off + val_len)]
                         match string.from_utf8(val_bytes) {
                             Some(val_str) => { row.values.push(val_str) }
@@ -765,6 +967,9 @@ pub fn Client.query_params(&mut self, sql &string, params &[]string) Result<Quer
         }
 
         if m_type == u8(90) { // 'Z' ReadyForQuery
+            if payload.len() != 1 || (payload.at(0) != 73 && payload.at(0) != 84 && payload.at(0) != 69) {
+                return Err(Error.new(ErrorKind.ProtocolError, "Invalid ReadyForQuery status"))
+            }
             if payload.len() > usize(0) {
                 self.status = payload.at(0)
             }
@@ -805,14 +1010,16 @@ pub fn Client.close(self) Result<void, Error> {
 pub struct Pool {
     pub config   Config
     pub max_size usize
-    clients      Vec<Client>
+    clients      Mutex<Vec<Client>>
+    active       AtomicUsize
 }
 
 pub fn Pool.new(config Config, max_size usize) Pool {
     return Pool{
         config: config,
         max_size: max_size,
-        clients: Vec.new()
+        clients: Mutex.new(Vec.new()),
+        active: AtomicUsize.new(0)
     }
 }
 
@@ -821,54 +1028,111 @@ pub fn Pool.from_url(url &string, max_size usize) Result<Pool, Error> {
     return Ok(Pool.new(cfg, max_size))
 }
 
-pub fn Pool.acquire(&mut self) Result<Client, Error> {
-    match self.clients.pop() {
+fn Pool.take_idle(&self) Option<Client> {
+    var guard = self.clients.lock()
+    return guard.value().pop()
+}
+
+pub fn Pool.acquire(&self) Result<Client, Error> {
+    match self.take_idle() {
         Some(c) => return Ok(c)
-        None => return Client.connect(self.config.clone())
+        None => {}
+    }
+    previous := self.active.fetch_add(1)
+    if previous >= self.max_size {
+        self.active.fetch_sub(1)
+        return Err(Error.new(ErrorKind.PoolExhausted, "PostgreSQL connection pool is at capacity"))
+    }
+    match Client.connect(self.config.clone()) {
+        Ok(client) => { return Ok(client) }
+        Err(error) => {
+            self.active.fetch_sub(1)
+            return Err(error)
+        }
     }
 }
 
-pub fn Pool.release(&mut self, client Client) {
-    if self.clients.len() < self.max_size {
-        self.clients.push(client)
+pub fn Pool.release(&self, client Client) {
+    if client.status == 73 {
+        var guard = self.clients.lock()
+        guard.value().push(client)
     } else {
+        self.active.fetch_sub(1)
         _ := client.close()
     }
 }
 
-pub fn Pool.query(&mut self, sql &string) Result<QueryResult, Error> {
+pub fn Pool.query(&self, sql &string) Result<QueryResult, Error> {
     var client = try self.acquire()
     res := client.query(sql)
     self.release(client)
     return res
 }
 
-pub fn Pool.query_params(&mut self, sql &string, params &[]string) Result<QueryResult, Error> {
+pub fn Pool.query_params(&self, sql &string, params &[]string) Result<QueryResult, Error> {
     var client = try self.acquire()
     res := client.query_params(sql, params)
     self.release(client)
     return res
 }
 
-pub fn Pool.execute(&mut self, sql &string) Result<string, Error> {
+pub fn Pool.execute(&self, sql &string) Result<string, Error> {
     var client = try self.acquire()
     res := client.execute(sql)
     self.release(client)
     return res
 }
 
-pub fn Pool.execute_params(&mut self, sql &string, params &[]string) Result<string, Error> {
+pub fn Pool.execute_params(&self, sql &string, params &[]string) Result<string, Error> {
     var client = try self.acquire()
     res := client.execute_params(sql, params)
     self.release(client)
     return res
 }
 
-pub fn Pool.close(&mut self) {
-    for !self.clients.is_empty() {
-        match self.clients.pop() {
-            Some(c) => { _ := c.close() }
+pub fn Pool.close(&self) {
+    var guard = self.clients.lock()
+    for !guard.value().is_empty() {
+        match guard.value().pop() {
+            Some(c) => {
+                self.active.fetch_sub(1)
+                _ := c.close()
+            }
             None => break
+        }
+    }
+}
+
+/// Explicit transactions stay on this client, never on a pooled query helper.
+pub fn Client.begin(&mut self) Result<void, Error> {
+    if self.status != 73 { return Err(Error.new(ErrorKind.QueryFailed, "BEGIN requires an idle connection")) }
+    _ := try self.execute("BEGIN")
+    return Ok(())
+}
+pub fn Client.commit(&mut self) Result<void, Error> {
+    if self.status != 84 { return Err(Error.new(ErrorKind.QueryFailed, "COMMIT requires an active, successful transaction")) }
+    _ := try self.execute("COMMIT")
+    return Ok(())
+}
+pub fn Client.rollback(&mut self) Result<void, Error> {
+    if self.status != 84 && self.status != 69 { return Err(Error.new(ErrorKind.QueryFailed, "ROLLBACK requires an active transaction")) }
+    _ := try self.execute("ROLLBACK")
+    return Ok(())
+}
+pub fn Client.transaction(&mut self, work fn(&mut Client) Result<void, Error>) Result<void, Error> {
+    try self.begin()
+    match work(self) {
+        Ok(value) => {
+            if self.status != 84 {
+                if self.status == 69 { _ := self.rollback() }
+                return Err(Error.new(ErrorKind.QueryFailed, "Transaction callback left an invalid transaction state"))
+            }
+            try self.commit()
+            return Ok(())
+        }
+        Err(error) => {
+            if self.status == 84 || self.status == 69 { _ := self.rollback() }
+            return Err(error)
         }
     }
 }
