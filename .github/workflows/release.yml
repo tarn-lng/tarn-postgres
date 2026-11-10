@@ -1,0 +1,86 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.5.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    name: Verify & Package (Tarn Official Container)
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/tarn-lng/tarn:0.3.0
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      archive: ${{ steps.meta.outputs.archive }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Verify version and run tests
+        id: meta
+        env:
+          INPUT_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -eu
+          TAG="$INPUT_TAG"
+          VERSION="${TAG#v}"
+          TOML_VERSION=$(sed -n 's/^version = "\([^"]*\)".*/\1/p' tarn.toml | head -n 1)
+          if [ "$VERSION" != "$TOML_VERSION" ]; then
+            echo "Tag $TAG does not match tarn.toml version $TOML_VERSION" >&2
+            exit 1
+          fi
+          tarn version
+          tarn check lib.tarn
+          tarn test tests.tarn
+          ARCHIVE="postgres-${VERSION}.tar.gz"
+          tar --sort=name --mtime='UTC 2026-01-01' --owner=0 --group=0 --numeric-owner \
+            -czf "$ARCHIVE" tarn.toml lib.tarn scram.tarn README.md
+          sha256sum "$ARCHIVE"
+          {
+            echo "tag=$TAG"
+            echo "version=$VERSION"
+            echo "archive=$ARCHIVE"
+          } >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-archive
+          path: ${{ steps.meta.outputs.archive }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-archive
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.verify.outputs.tag }}
+          VERSION: ${{ needs.verify.outputs.version }}
+          ARCHIVE: ${{ needs.verify.outputs.archive }}
+        run: |
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$ARCHIVE" --clobber --repo "$REPO"
+          else
+            gh release create "$TAG" "$ARCHIVE" \
+              --repo "$REPO" \
+              --verify-tag \
+              --title "$TAG" \
+              --generate-notes
+          fi
